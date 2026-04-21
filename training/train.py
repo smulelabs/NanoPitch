@@ -101,6 +101,12 @@ parser.add_argument("--amp", action="store_true",
 # Data augmentation (used by augment_mel_batch once implemented)
 parser.add_argument("--snr-range", type=float, nargs=2, default=[-5.0, 20.0],
                     help="min/max SNR in dB for noise mixing (see augment_mel_batch)")
+parser.add_argument("--augment", type=str, default="none",
+                    choices=["none", "noise", "noise_specaug"],
+                    help="Input-side augmentation. 'none' = upstream baseline "
+                         "(no noise mix, no SpecAugment). 'noise' = noise mixing only "
+                         "(augment_mel_batch, honours --snr-range/--p-clean/--snr-bias). "
+                         "'noise_specaug' = noise mixing + SpecAugment.")
 parser.add_argument("--p-clean", type=float, default=0.0,
                     help="probability of passing a batch row through with no noise "
                          "(0 = always mix, 0.3 = ~30%% of rows are pure clean)")
@@ -114,6 +120,30 @@ parser.add_argument("--w-vad", type=float, default=0.1,
                     help="weight for VAD loss")
 parser.add_argument("--w-pitch", type=float, default=1.0,
                     help="weight for pitch loss")
+
+parser.add_argument("--pitch-sigma", type=float, default=1.2,
+                    help="Gaussian sigma (in bins) for pitch posteriorgram target. "
+                         "Lower = sharper supervision (try 0.8).")
+parser.add_argument("--pitch-mask", type=str, default="vad",
+                    choices=["vad", "strict"],
+                    help="Mask used for pitch loss. 'vad' = clean_vad (broad), "
+                         "'strict' = (f0>0) — recommended to avoid training pitch head "
+                         "on silent frames marked voiced by clean_vad.")
+
+parser.add_argument("--scheduler", type=str, default="constant",
+                    choices=["constant", "cosine_warmup", "cosine_warmrestart"],
+                    help="LR schedule. 'constant' = upstream baseline (no decay). "
+                         "'cosine_warmup' = 1-epoch LinearLR warmup + CosineAnnealingLR (per-iter). "
+                         "'cosine_warmrestart' = CosineAnnealingWarmRestarts (per-epoch, T_0=--lr-t0).")
+parser.add_argument("--vad-target", type=str, default="f0",
+                    choices=["f0", "clean_vad"],
+                    help="VAD training label. 'f0' = (clean_f0 > 0), upstream baseline. "
+                         "'clean_vad' = dataset clean_vad array (broader).")
+parser.add_argument("--eval-vdr", type=str, default="pitch",
+                    choices=["pitch", "vad"],
+                    help="Source of voicing call for eval VDR metric. "
+                         "'pitch' = pitch-decode (f0_decoded > 0), upstream baseline. "
+                         "'vad' = VAD head (pv > 0.5).")
 
 parser.add_argument("--lr-t0", type=int, default=10,
                     help="length of the first cosine cycle before the first restart")
@@ -144,8 +174,9 @@ class NanoPitchDataset(Dataset):
     function is implemented.
     """
 
-    def __init__(self, data_dir, seq_len=200):
+    def __init__(self, data_dir, seq_len=200, vad_target="f0"):
         self.seq_len = seq_len
+        self.vad_target = vad_target
 
         # Load pre-extracted features (stored as float16 to save disk space)
         print("Loading clean.npz...")
@@ -200,8 +231,10 @@ class NanoPitchDataset(Dataset):
 
         mel_clean = self.clean_mel[s:s + self.seq_len].astype(np.float32)
         f0 = self.clean_f0[s:s + self.seq_len].astype(np.float32)
-        vad = self.clean_vad[s:s + self.seq_len].astype(np.float32)
-        # vad = (self.clean_f0[s:s + self.seq_len] > 0).astype(np.float32)
+        if self.vad_target == "clean_vad":
+            vad = self.clean_vad[s:s + self.seq_len].astype(np.float32)
+        else:  # "f0" — upstream baseline
+            vad = (self.clean_f0[s:s + self.seq_len] > 0).astype(np.float32)
 
         # Pick a random noise segment (independently)
         noise_idx = self.rng.integers(len(self.noise_segments))
@@ -290,23 +323,11 @@ def spec_augment(mel, n_freq_masks=2, freq_mask_param=4,
             mel[b, t0:t0 + t, :] = 0.0
     return mel
 
-def _rpa_score(eval_results, clean_weight=0.6):
-    """Weighted composite of clean RPA and macro-average RPA.
-
-    higher clean_weight favours the
-    'RPA Clean'; lower favours 'RPA Macro Average'.
-    Returns nan if either metric is unavailable.
-    """
-    rpa_clean = eval_results.get('clean', {}).get('rpa', float('nan'))
+def _macro_rpa(eval_results):
+    """Macro-average RPA across conditions — the leaderboard metric."""
     all_rpa = [v['rpa'] for v in eval_results.values()
                if not np.isnan(v.get('rpa', float('nan')))]
-    rpa_macro = float(np.mean(all_rpa)) if all_rpa else float('nan')
-
-    if np.isnan(rpa_clean) or np.isnan(rpa_macro):
-        return float('nan'), rpa_clean, rpa_macro
-
-    score = clean_weight * rpa_clean + (1.0 - clean_weight) * rpa_macro
-    return score, rpa_clean, rpa_macro
+    return float(np.mean(all_rpa)) if all_rpa else float('nan')
 
 def _set_phase(model, phase):
     """Toggle requires_grad for curriculum training phases.
@@ -360,13 +381,18 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
         bin_grid = torch.arange(PITCH_BINS, device=device,
                                 dtype=torch.float32).view(1, 1, -1)                # (1, 1, 360)
         dist = bin_grid - bins.unsqueeze(-1).float()                               # (B, T, 360)
-        pitch_target = torch.exp(-0.5 * (dist / 1.2) ** 2) * voiced                # (B, T, 360)
+        pitch_target = torch.exp(-0.5 * (dist / args.pitch_sigma) ** 2) * voiced   # (B, T, 360)
 
-        # ── Data augmentation (implement in augment_mel_batch) ──
-        mel_mix = augment_mel_batch(mel_clean, mel_noise, args.snr_range, device,
-                                    p_clean=args.p_clean, snr_bias=args.snr_bias)
-        # SpecAugment
-        mel_mix = spec_augment(mel_mix)
+        # ── Data augmentation (flag-gated for baseline compatibility) ──
+        if args.augment == "none":
+            mel_mix = mel_clean                              # upstream baseline
+        elif args.augment == "noise":
+            mel_mix = augment_mel_batch(mel_clean, mel_noise, args.snr_range, device,
+                                        p_clean=args.p_clean, snr_bias=args.snr_bias)
+        else:  # "noise_specaug"
+            mel_mix = augment_mel_batch(mel_clean, mel_noise, args.snr_range, device,
+                                        p_clean=args.p_clean, snr_bias=args.snr_bias)
+            mel_mix = spec_augment(mel_mix)
 
         # ── Forward Pass (under autocast when AMP is enabled) ──
         # Causal convs → output same length as input, no trimming needed.
@@ -388,7 +414,10 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
 
             # Pitch loss: BCE on the 360-dim posteriorgram, but weighted
             # by VAD — we don't penalize pitch errors on silent frames
-            voiced_weight = vad_target.unsqueeze(-1)  # (B, T, 1)
+            if args.pitch_mask == "strict":
+                voiced_weight = (f0_dev > 0).float().unsqueeze(-1)  # matches pitch_target
+            else:
+                voiced_weight = vad_target.unsqueeze(-1)  # broad clean_vad
             pitch_loss = (voiced_weight * bce(pred_pitch, pitch_target)).mean()
 
             # Combined loss (weighted sum)
@@ -407,7 +436,8 @@ def train_one_epoch(model, dataloader, optimizer, scheduler, writer,
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
         writer.add_scalar("train/grad_norm", grad_norm, global_step_offset + batch_idx)
-        # scheduler.step()       # decay learning rate
+        if getattr(args, "_scheduler_step", "epoch") == "iter":
+            scheduler.step()   # per-iteration step (cosine_warmup)
 
         # ── Logging ──
         running['loss'] += loss.item()
@@ -488,7 +518,10 @@ def evaluate(model, data_dir, writer, epoch, device, args):
         # Voicing detection rate: of the frames that ARE voiced, how many
         # did the model correctly identify as voiced?
         vg = f0r > 0
-        vp = f0d > 0
+        if getattr(args, "eval_vdr", "pitch") == "vad":
+            vp = pv > 0.5                      # VAD head voicing call
+        else:
+            vp = f0d > 0                       # pitch-decode voicing (baseline)
         vdr = float(np.mean(vp[vg])) if vg.sum() > 0 else np.nan
 
         # Raw Pitch Accuracy: of frames where both ground-truth and
@@ -583,7 +616,8 @@ def main():
         print("  [amp] fp16 mixed precision enabled.")
 
     # Create data pipeline
-    dataset = NanoPitchDataset(data_dir, seq_len=args.seq_len)
+    dataset = NanoPitchDataset(data_dir, seq_len=args.seq_len,
+                               vad_target=args.vad_target)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                             num_workers=args.num_workers, drop_last=True,
                             pin_memory=(device.type == "cuda"),
@@ -612,8 +646,29 @@ def main():
     #     optimizer, lr_lambda=lambda step: 1.0)  # constant LR — replace me
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     # optimizer, T_max=args.epochs, eta_min=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=args.lr_t0, T_mult=2, eta_min=1e-5)
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    #         optimizer, T_0=args.lr_t0, T_mult=2, eta_min=1e-5)
+    from torch.optim.lr_scheduler import (LinearLR, CosineAnnealingLR,
+                                           SequentialLR, LambdaLR,
+                                           CosineAnnealingWarmRestarts)
+    if args.scheduler == "constant":
+        # Upstream baseline: constant LR (stepped per-epoch, no-op).
+        scheduler = LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
+        scheduler_step = "epoch"
+    elif args.scheduler == "cosine_warmup":
+        total_iters = len(dataloader) * args.epochs
+        warmup_iters = len(dataloader)  # 1 epoch of warmup
+        warmup = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_iters)
+        cosine = CosineAnnealingLR(optimizer, T_max=total_iters - warmup_iters,
+                                   eta_min=1e-5)
+        scheduler = SequentialLR(optimizer, [warmup, cosine],
+                                 milestones=[warmup_iters])
+        scheduler_step = "iter"
+    else:  # "cosine_warmrestart"
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=args.lr_t0,
+                                                T_mult=2, eta_min=1e-5)
+        scheduler_step = "epoch"
+    args._scheduler_step = scheduler_step
     
     # load checkpoint states into optimizer and scheduler if resuming
     if resume_ckpt:
@@ -630,7 +685,6 @@ def main():
 
     # ── Training loop ──
     best_loss = float("inf")
-    best_score = 0.0          # weighted (clean-biased) RPA composite
     best_macro_rpa = 0.0      # unweighted macro RPA → equivalent to best macro gross-err
     patience_counter = 0
     global_step_offset = 0
@@ -672,7 +726,9 @@ def main():
                                     writer, epoch, device, args,
                                     global_step_offset=global_step_offset, scaler=scaler)
         global_step_offset += len(dataloader)  # keep track of total steps for LR scheduling
-        scheduler.step()  # if using an epoch-level scheduler, step it here
+        if args._scheduler_step == "epoch":
+            scheduler.step()   # per-epoch step (constant / cosine_warmrestart)
+        # else: per-iter step already happened inside train_one_epoch
         dt = time.time() - t0
         print(f"  Epoch {epoch} done in {dt:.1f}s, loss={train_loss:.5f}")
 
@@ -682,40 +738,31 @@ def main():
                 "scheduler": scheduler.state_dict(),
                 "model_kwargs": {"cond_size": args.cond_size,
                                 "gru_size": args.gru_size},
+                "args": vars(args),
                 "loss": train_loss}
         torch.save(ckpt, os.path.join(ckpt_dir, f"epoch_{epoch:03d}.pth"))
         
         # Evaluate every 5 epochs (and on the first epoch)
         if epoch % 5 == 0 or epoch == start_epoch:
-            # evaluate(model, data_dir, writer, epoch, device, args)
-            # Compute macro-avg RPA across all SNR levels for early stopping
             eval_results = evaluate(model, data_dir, writer, epoch, device, args)
             if eval_results:
-                score, rpa_clean, rpa_macro = _rpa_score(eval_results)
-                print(f"  RPA  clean={rpa_clean:.4f}  macro={rpa_macro:.4f}  "
-                f"score={score:.4f}  (w_clean={0.6})")
-                # Early stopping based on macro-avg RPA
-                if not np.isnan(score) and score > best_score:
-                    best_score = score
-                    patience_counter = 0
-                    torch.save(ckpt, os.path.join(ckpt_dir, "bestclean_rpa.pth"))
-                    print(f" New best RPA score: {best_score:.4f} "
-                        f"(clean={rpa_clean:.4f}, macro={rpa_macro:.4f}) — checkpoint saved.")
-                elif not np.isnan(score):
-                    patience_counter += 5 # Increment by 5 since we evaluate every 5 epochs
-                    if args.patience > 0 and patience_counter >= args.patience:
-                        print(f" Early stopping triggered after {epoch} epochs without improvement "
-                            f"(best score: {best_score:.4f}).")
-                        break
-
-                # Track best unweighted macro RPA separately. On the offline
-                # decoder, macro gross_err = 1 - macro_rpa exactly, so this is
-                # the best-macro-gross-err checkpoint at zero extra cost.
+                rpa_macro = _macro_rpa(eval_results)
+                print(f"  RPA  macro={rpa_macro:.4f}")
+                # Track best macro RPA — this is the leaderboard metric.
+                # On the offline decoder, macro gross_err = 1 - macro_rpa exactly,
+                # so this is also the best-macro-gross-err checkpoint at zero extra cost.
                 if not np.isnan(rpa_macro) and rpa_macro > best_macro_rpa:
                     best_macro_rpa = rpa_macro
+                    patience_counter = 0
                     torch.save(ckpt, os.path.join(ckpt_dir, "best_macro_rpa.pth"))
                     print(f" New best macro RPA: {best_macro_rpa:.4f} "
                         f"(macro gross_err={1.0 - best_macro_rpa:.4f}) — checkpoint saved.")
+                elif not np.isnan(rpa_macro):
+                    patience_counter += 5
+                    if args.patience > 0 and patience_counter >= args.patience:
+                        print(f" Early stopping triggered after {epoch} epochs without improvement "
+                            f"(best macro RPA: {best_macro_rpa:.4f}).")
+                        break
 
         # Also save as "best" if this is the lowest loss so far
         if train_loss < best_loss:
@@ -725,7 +772,6 @@ def main():
     writer.close()
     print(f"\nTraining complete. Best loss: {best_loss:.5f}")
     print(f"Best loss       checkpoint : {ckpt_dir}/best.pth")
-    print(f"Best clean-RPA  checkpoint : {ckpt_dir}/bestclean_rpa.pth  (score={best_score:.4f})")
     print(f"Best macro-RPA  checkpoint : {ckpt_dir}/best_macro_rpa.pth  "
           f"(macro_rpa={best_macro_rpa:.4f}, macro_gross_err={1.0 - best_macro_rpa:.4f})")
     
