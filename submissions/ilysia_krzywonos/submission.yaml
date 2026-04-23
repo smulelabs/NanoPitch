@@ -1,0 +1,2 @@
+name: "Ilysia Krzywonos"
+note: "Adjusted the weight for pitch/VAD loss, implemented noise augmentation and learning rate scheduler"

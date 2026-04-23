@@ -1,0 +1,2 @@
+name: "Rajat Sharma"
+note: "Noise+SpecAugmentation(freq_mask=4, time_mask=10), cosineCosineAnnealingLR, sharper pitch supervision,VAD label and loss improvements (gru_size=128, cond_size=64, lr=1e-3)."

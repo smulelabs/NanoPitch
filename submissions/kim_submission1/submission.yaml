@@ -1,0 +1,9 @@
+name: Kim Huy Heng
+note: "Implemented a staged curriculum training pipeline 
+  for the pitch detection model by progressively increasing 
+  log-mel noise augmentation probability (0% → 30% → 60% → 80%) 
+  while resuming from the best checkpoint at each stage. 
+  Used log-domain SNR mixing and SpecAugment-style robustness training, 
+  and monitored performance across multiple noise conditions to balance 
+  clean accuracy with noise robustness, leading to improved VDR under 
+  low SNR without degrading RPA."

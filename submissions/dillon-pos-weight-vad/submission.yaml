@@ -1,0 +1,2 @@
+name: "Dillon Positive Weight"
+note: "Applied recommended augmentation w/ 25% chance of clean output and applied 0.6x weight to stop the model from over-favoring voiced predictions."

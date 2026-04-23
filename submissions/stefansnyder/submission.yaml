@@ -1,0 +1,2 @@
+name: "Stefan Snyder"
+note: "Run with the augment mel batch implemented (gru_size=96, cond_size=64, lr=1e-3)."

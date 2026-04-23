@@ -1,0 +1,857 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NanoPitch Leaderboard Charts</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f7fa;
+      color: #1a1a2e;
+      margin: 0;
+      padding: 1.5rem;
+    }
+    h1 { font-size: 1.6rem; margin-bottom: 0.2rem; }
+    .subtitle { color: #555; font-size: 0.9rem; margin-bottom: 2rem; }
+    h2 { font-size: 1.1rem; margin: 2rem 0 0.8rem; color: #333; border-bottom: 2px solid #ddd; padding-bottom: 0.3rem; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    .card {
+      background: #fff;
+      border-radius: 10px;
+      padding: 1.2rem 1.5rem;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.08);
+    }
+    .card h3 { margin: 0 0 0.8rem; font-size: 0.95rem; color: #444; }
+    canvas { max-height: 280px; }
+    .full-width { grid-column: 1 / -1; }
+    .full-width canvas { max-height: 320px; }
+    @media (max-width: 700px) { .grid-2 { grid-template-columns: 1fr; } }
+
+    /* ── sortable table ── */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    thead th {
+      background: #f0f2f5;
+      padding: 0.55rem 0.8rem;
+      text-align: left;
+      white-space: nowrap;
+      cursor: pointer;
+      user-select: none;
+      border-bottom: 2px solid #d0d4da;
+    }
+    thead th:hover { background: #e4e8ee; }
+    thead th.active { background: #dce6f5; color: #1a4a8a; }
+    tbody tr { border-bottom: 1px solid #eee; }
+    tbody tr:hover { background: #f9fbff; }
+    tbody td { padding: 0.5rem 0.8rem; vertical-align: top; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td.rank { text-align: center; color: #888; font-weight: 600; }
+    td.note-cell {
+      max-width: 220px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: #666;
+    }
+    .swatch { display: inline-block; width: 10px; height: 10px;
+               border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <h1>NanoPitch Student Leaderboard</h1>
+  <p class="subtitle">
+    16 submissions &nbsp;·&nbsp; Last updated: 2026-04-23 &nbsp;·&nbsp;
+    Realtime Viterbi decoder &nbsp;·&nbsp;
+    <a href="LEADERBOARD.md">Static MD table</a>
+  </p>
+
+  <h2>Rankings</h2>
+  <div class="card">
+    <p style="font-size:0.82rem;color:#666;margin:0 0 0.8rem">
+      Click any column header to sort. Click again to reverse. Default: RPA Clean, best first.
+    </p>
+    <div class="table-wrap">
+      <table id="leaderTable">
+        <thead><tr></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2>Summary — 4 Key Metrics</h2>
+  <div class="grid-2">
+    <div class="card">
+      <h3>RPA — Clean Audio ↑ (higher is better)</h3>
+      <canvas id="rpaCleanchart"></canvas>
+    </div>
+    <div class="card">
+      <h3>RPA — Macro Average across all SNR conditions ↑</h3>
+      <canvas id="rpaMacrochart"></canvas>
+    </div>
+    <div class="card">
+      <h3>Gross Error Rate — Clean Audio ↓ (lower is better)</h3>
+      <canvas id="gerCleanchart"></canvas>
+    </div>
+    <div class="card">
+      <h3>Gross Error Rate — Macro Average across all SNR conditions ↓</h3>
+      <canvas id="gerMacrochart"></canvas>
+    </div>
+  </div>
+
+  <h2>Performance Across Noise Conditions</h2>
+  <div class="grid-2">
+    <div class="card full-width">
+      <h3>RPA by SNR Condition ↑</h3>
+      <canvas id="rpaSnrchart"></canvas>
+    </div>
+    <div class="card full-width">
+      <h3>Gross Error Rate by SNR Condition ↓</h3>
+      <canvas id="gerSnrchart"></canvas>
+    </div>
+  </div>
+
+<script>
+const D = {
+  "labels": [
+    "Rajat Sharma",
+    "Festus Ewakaa Kahunla",
+    "Dillon Best",
+    "Brady Chase",
+    "Ilysia Krzywonos",
+    "Dillon RPA Focus",
+    "Uddhav Jain",
+    "Charis NoiseAugBaseline",
+    "Dillon Positive Weight",
+    "Charis Test",
+    "Rajat Sharma",
+    "Dabin Seomun",
+    "Stefan Snyder - Baseline",
+    "Kim Huy Heng",
+    "Charis - Noise Augmentation v2",
+    "Chris Rui Zhao"
+  ],
+  "colors": [
+    "#4C72B0",
+    "#DD8452",
+    "#55A868",
+    "#C44E52",
+    "#8172B2",
+    "#937860",
+    "#DA8BC3",
+    "#8C8C8C"
+  ],
+  "snr_labels": [
+    "Clean",
+    "\u22125 dB",
+    "0 dB",
+    "+5 dB",
+    "+10 dB",
+    "+20 dB"
+  ],
+  "rpa_by_snr": [
+    [
+      98.0,
+      94.19,
+      93.71,
+      95.51,
+      97.51,
+      97.56
+    ],
+    [
+      97.1,
+      87.89,
+      92.05,
+      89.36,
+      89.54,
+      94.08
+    ],
+    [
+      97.01,
+      93.15,
+      91.53,
+      93.34,
+      95.3,
+      94.28
+    ],
+    [
+      96.81,
+      91.5,
+      91.38,
+      92.06,
+      94.43,
+      94.32
+    ],
+    [
+      96.77,
+      92.12,
+      90.91,
+      93.4,
+      96.2,
+      94.24
+    ],
+    [
+      96.75,
+      93.31,
+      92.29,
+      94.35,
+      95.06,
+      94.06
+    ],
+    [
+      96.66,
+      91.64,
+      91.94,
+      91.82,
+      95.23,
+      95.14
+    ],
+    [
+      96.61,
+      87.79,
+      88.81,
+      92.32,
+      93.45,
+      92.37
+    ],
+    [
+      95.37,
+      91.29,
+      89.07,
+      91.16,
+      94.51,
+      91.8
+    ],
+    [
+      94.82,
+      88.04,
+      87.32,
+      89.04,
+      89.75,
+      92.21
+    ],
+    [
+      93.83,
+      88.65,
+      88.57,
+      92.32,
+      93.21,
+      94.57
+    ],
+    [
+      92.76,
+      88.58,
+      87.33,
+      87.96,
+      91.27,
+      93.51
+    ],
+    [
+      91.12,
+      80.98,
+      85.4,
+      86.17,
+      87.73,
+      86.28
+    ],
+    [
+      90.78,
+      89.17,
+      86.98,
+      88.5,
+      91.61,
+      90.08
+    ],
+    [
+      90.08,
+      88.42,
+      86.29,
+      85.46,
+      90.46,
+      87.5
+    ],
+    [
+      89.95,
+      83.35,
+      82.93,
+      86.18,
+      87.62,
+      86.84
+    ]
+  ],
+  "ger_by_snr": [
+    [
+      2.0,
+      5.81,
+      6.29,
+      4.49,
+      2.49,
+      2.44
+    ],
+    [
+      2.9,
+      12.11,
+      7.95,
+      10.64,
+      10.46,
+      5.92
+    ],
+    [
+      2.99,
+      6.85,
+      8.47,
+      6.66,
+      4.7,
+      5.72
+    ],
+    [
+      3.19,
+      8.5,
+      8.62,
+      7.94,
+      5.57,
+      5.68
+    ],
+    [
+      3.23,
+      7.88,
+      9.09,
+      6.6,
+      3.8,
+      5.76
+    ],
+    [
+      3.25,
+      6.69,
+      7.71,
+      5.65,
+      4.94,
+      5.94
+    ],
+    [
+      3.34,
+      8.36,
+      8.06,
+      8.18,
+      4.77,
+      4.86
+    ],
+    [
+      3.39,
+      12.21,
+      11.19,
+      7.68,
+      6.55,
+      7.63
+    ],
+    [
+      4.63,
+      8.71,
+      10.93,
+      8.84,
+      5.49,
+      8.2
+    ],
+    [
+      5.18,
+      11.96,
+      12.68,
+      10.96,
+      10.25,
+      7.79
+    ],
+    [
+      6.17,
+      11.35,
+      11.43,
+      7.68,
+      6.79,
+      5.43
+    ],
+    [
+      7.24,
+      11.42,
+      12.67,
+      12.04,
+      8.73,
+      6.49
+    ],
+    [
+      8.88,
+      19.02,
+      14.6,
+      13.83,
+      12.27,
+      13.72
+    ],
+    [
+      9.22,
+      10.83,
+      13.02,
+      11.5,
+      8.39,
+      9.92
+    ],
+    [
+      9.92,
+      11.58,
+      13.71,
+      14.54,
+      9.54,
+      12.5
+    ],
+    [
+      10.05,
+      16.65,
+      17.07,
+      13.82,
+      12.38,
+      13.16
+    ]
+  ],
+  "rpa_clean": [
+    98.0,
+    97.1,
+    97.01,
+    96.81,
+    96.77,
+    96.75,
+    96.66,
+    96.61,
+    95.37,
+    94.82,
+    93.83,
+    92.76,
+    91.12,
+    90.78,
+    90.08,
+    89.95
+  ],
+  "rpa_macro": [
+    96.08,
+    91.67,
+    94.1,
+    93.42,
+    93.94,
+    94.3,
+    93.74,
+    91.89,
+    92.2,
+    90.2,
+    91.86,
+    90.24,
+    86.28,
+    89.52,
+    88.03,
+    86.15
+  ],
+  "ger_clean": [
+    2.0,
+    2.9,
+    2.99,
+    3.19,
+    3.23,
+    3.25,
+    3.34,
+    3.39,
+    4.63,
+    5.18,
+    6.17,
+    7.24,
+    8.88,
+    9.22,
+    9.92,
+    10.05
+  ],
+  "ger_macro": [
+    3.92,
+    8.33,
+    5.9,
+    6.58,
+    6.06,
+    5.7,
+    6.26,
+    8.11,
+    7.8,
+    9.8,
+    8.14,
+    9.77,
+    13.72,
+    10.48,
+    11.96,
+    13.85
+  ],
+  "table_rows": [
+    {
+      "name": "Rajat Sharma",
+      "note": "Noise+SpecAugmentation(freq_mask=4, time_mask=10), cosineCosineAnnealingLR, sharper pitch supervision,VAD label and loss improvements (gru_size=128, cond_size=64, lr=1e-3).",
+      "rpa_clean": 98.0,
+      "rpa_macro": 96.08,
+      "ger_clean": 2.0,
+      "ger_macro": 3.92,
+      "vdr_clean": 78.58,
+      "vdr_macro": 71.93,
+      "vad_clean": 92.11,
+      "vad_macro": 91.54
+    },
+    {
+      "name": "Festus Ewakaa Kahunla",
+      "note": "Fixed train/eval label mismatch: VAD target now derived from f0>0 (RMVPE) instead of the RMS-energy vad label, which disagrees with RMVPE on 12.1% of frames. Added cosine annealing LR (CosineAnnealingWarmRestarts, T_0=10, T_mult=2, eta_min=1e-5). Reduced Viterbi onset penalty from 2.0 to 1.0. Trained 100 epochs from scratch (50 + 50 resume).",
+      "rpa_clean": 97.1,
+      "rpa_macro": 91.67,
+      "ger_clean": 2.9,
+      "ger_macro": 8.33,
+      "vdr_clean": 85.77,
+      "vdr_macro": 69.83,
+      "vad_clean": 79.9,
+      "vad_macro": 79.69
+    },
+    {
+      "name": "Dillon Best",
+      "note": "150 epoch, 112 GRU, tweaked VAD RPA loss weights, started with 5 + 20 individual feature training epochs, cosine annealing, 0.6 voiced/unvoiced weighting, augmentation + clean probability",
+      "rpa_clean": 97.01,
+      "rpa_macro": 94.1,
+      "ger_clean": 2.99,
+      "ger_macro": 5.9,
+      "vdr_clean": 78.04,
+      "vdr_macro": 70.72,
+      "vad_clean": 98.45,
+      "vad_macro": 96.4
+    },
+    {
+      "name": "Brady Chase",
+      "note": "Codex updates when told to focus on changes in read me and with extra emphasiss on how VDR is being impacted so try for constant improvement(gru_size=96, cond_size=64, lr=0.0001).",
+      "rpa_clean": 96.81,
+      "rpa_macro": 93.42,
+      "ger_clean": 3.19,
+      "ger_macro": 6.58,
+      "vdr_clean": 70.63,
+      "vdr_macro": 64.19,
+      "vad_clean": 80.01,
+      "vad_macro": 81.13
+    },
+    {
+      "name": "Ilysia Krzywonos",
+      "note": "Adjusted the weight for pitch/VAD loss, implemented noise augmentation and learning rate scheduler",
+      "rpa_clean": 96.77,
+      "rpa_macro": 93.94,
+      "ger_clean": 3.23,
+      "ger_macro": 6.06,
+      "vdr_clean": 72.54,
+      "vdr_macro": 66.48,
+      "vad_clean": 97.92,
+      "vad_macro": 94.87
+    },
+    {
+      "name": "Dillon RPA Focus",
+      "note": "Previous best with 0.4 weight ratio to prioritize RPA loss",
+      "rpa_clean": 96.75,
+      "rpa_macro": 94.3,
+      "ger_clean": 3.25,
+      "ger_macro": 5.7,
+      "vdr_clean": 78.3,
+      "vdr_macro": 71.24,
+      "vad_clean": 98.43,
+      "vad_macro": 96.35
+    },
+    {
+      "name": "Uddhav Jain",
+      "note": "VDR-focused GRU-128 run (submitted from expD_best.pth).",
+      "rpa_clean": 96.66,
+      "rpa_macro": 93.74,
+      "ger_clean": 3.34,
+      "ger_macro": 6.26,
+      "vdr_clean": 76.11,
+      "vdr_macro": 67.47,
+      "vad_clean": 98.57,
+      "vad_macro": 95.77
+    },
+    {
+      "name": "Charis NoiseAugBaseline",
+      "note": "Baseline run with default hyperparameters, and the baseline noise augmentation (gru_size=96, cond_size=64, lr=1e-3).",
+      "rpa_clean": 96.61,
+      "rpa_macro": 91.89,
+      "ger_clean": 3.39,
+      "ger_macro": 8.11,
+      "vdr_clean": 62.71,
+      "vdr_macro": 58.84,
+      "vad_clean": 97.29,
+      "vad_macro": 94.83
+    },
+    {
+      "name": "Dillon Positive Weight",
+      "note": "Applied recommended augmentation w/ 25% chance of clean output and applied 0.6x weight to stop the model from over-favoring voiced predictions.",
+      "rpa_clean": 95.37,
+      "rpa_macro": 92.2,
+      "ger_clean": 4.63,
+      "ger_macro": 7.8,
+      "vdr_clean": 70.09,
+      "vdr_macro": 64.22,
+      "vad_clean": 97.71,
+      "vad_macro": 95.15
+    },
+    {
+      "name": "Charis Test",
+      "note": "Baseline run with default hyperparameters (gru_size=96, cond_size=64, lr=1e-3).",
+      "rpa_clean": 94.82,
+      "rpa_macro": 90.2,
+      "ger_clean": 5.18,
+      "ger_macro": 9.8,
+      "vdr_clean": 82.71,
+      "vdr_macro": 66.25,
+      "vad_clean": 98.34,
+      "vad_macro": 87.15
+    },
+    {
+      "name": "Rajat Sharma",
+      "note": "Baseline run with default hyperparameters and default augmentation (gru_size=96, cond_size=64, lr=1e-3).",
+      "rpa_clean": 93.83,
+      "rpa_macro": 91.86,
+      "ger_clean": 6.17,
+      "ger_macro": 8.14,
+      "vdr_clean": 62.25,
+      "vdr_macro": 58.03,
+      "vad_clean": 97.0,
+      "vad_macro": 94.62
+    },
+    {
+      "name": "Dabin Seomun",
+      "note": "Noise augmentation using a normal distribution for SNR sampling (mean=10, std=5) & Ran 100 epochs",
+      "rpa_clean": 92.76,
+      "rpa_macro": 90.24,
+      "ger_clean": 7.24,
+      "ger_macro": 9.77,
+      "vdr_clean": 68.25,
+      "vdr_macro": 63.4,
+      "vad_clean": 97.29,
+      "vad_macro": 95.17
+    },
+    {
+      "name": "Stefan Snyder - Baseline",
+      "note": "Baseline run with default hyperparameters, and the baseline noise augmentation (gru_size=96, cond_size=64, lr=1e-3).",
+      "rpa_clean": 91.12,
+      "rpa_macro": 86.28,
+      "ger_clean": 8.88,
+      "ger_macro": 13.72,
+      "vdr_clean": 87.99,
+      "vdr_macro": 70.29,
+      "vad_clean": 98.43,
+      "vad_macro": 86.7
+    },
+    {
+      "name": "Kim Huy Heng",
+      "note": "Implemented a staged curriculum training pipeline",
+      "rpa_clean": 90.78,
+      "rpa_macro": 89.52,
+      "ger_clean": 9.22,
+      "ger_macro": 10.48,
+      "vdr_clean": 76.58,
+      "vdr_macro": 66.7,
+      "vad_clean": 97.92,
+      "vad_macro": 95.18
+    },
+    {
+      "name": "Charis - Noise Augmentation v2",
+      "note": "Baseline run with default hyperparameters, with the basic noise augmentation and clean signal 10% of the time (gru_size=96, cond_size=64, lr=1e-3).",
+      "rpa_clean": 90.08,
+      "rpa_macro": 88.03,
+      "ger_clean": 9.92,
+      "ger_macro": 11.96,
+      "vdr_clean": 62.27,
+      "vdr_macro": 58.26,
+      "vad_clean": 95.75,
+      "vad_macro": 94.17
+    },
+    {
+      "name": "Chris Rui Zhao",
+      "note": "Added augmentations, specaugment, cosine annealing, and BCEWithLogitsLoss with Claude Opus 4.7's suggestions.",
+      "rpa_clean": 89.95,
+      "rpa_macro": 86.15,
+      "ger_clean": 10.05,
+      "ger_macro": 13.85,
+      "vdr_clean": 93.65,
+      "vdr_macro": 89.1,
+      "vad_clean": 92.98,
+      "vad_macro": 91.5
+    }
+  ]
+};
+
+// ── sortable table ────────────────────────────────────────────────────────────
+
+const COLS = [
+  { key: "name",      label: "Student",       fmt: v => v,                  lower: null  },
+  { key: "rpa_clean", label: "RPA Clean",     fmt: v => v.toFixed(1) + "%", lower: false },
+  { key: "rpa_macro", label: "RPA Macro Avg", fmt: v => v.toFixed(1) + "%", lower: false },
+  { key: "ger_clean", label: "GER Clean",     fmt: v => v.toFixed(1) + "%", lower: true  },
+  { key: "ger_macro", label: "GER Macro Avg", fmt: v => v.toFixed(1) + "%", lower: true  },
+  { key: "vdr_clean", label: "VDR Clean",     fmt: v => v.toFixed(1) + "%", lower: false },
+  { key: "vdr_macro", label: "VDR Macro Avg", fmt: v => v.toFixed(1) + "%", lower: false },
+  { key: "vad_clean", label: "VAD Acc Clean", fmt: v => v.toFixed(1) + "%", lower: false },
+  { key: "vad_macro", label: "VAD Acc Macro", fmt: v => v.toFixed(1) + "%", lower: false },
+  { key: "note",      label: "Note",          fmt: v => v,                  lower: null  },
+];
+
+// suffix shown in the header when column is not active
+const HINT = { false: " ↑", true: " ↓", null: "" };
+
+let sortKey = "rpa_clean";
+let sortAsc  = false;   // false = descending = best-first for "higher is better" cols
+
+function renderTable() {
+  // ── header ──
+  const headRow = document.querySelector("#leaderTable thead tr");
+  headRow.innerHTML = COLS.map(c => {
+    const active = c.key === sortKey;
+    const arrow  = active ? (sortAsc ? " ▲" : " ▼") : HINT[c.lower];
+    return `<th data-key="${c.key}"${active ? ' class="active"' : ''}>${c.label}${arrow}</th>`;
+  }).join("");
+
+  // ── body ──
+  const sorted = [...D.table_rows].sort((a, b) => {
+    const av = a[sortKey], bv = b[sortKey];
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (typeof av === "string") return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+    return sortAsc ? av - bv : bv - av;
+  });
+
+  document.querySelector("#leaderTable tbody").innerHTML = sorted.map((r, i) => {
+    const swatch = D.colors[D.table_rows.indexOf(r)] || "#aaa";
+    return "<tr>" +
+      `<td class="rank">${i + 1}</td>` +
+      COLS.map(c => {
+        const val = r[c.key];
+        const text = val != null ? c.fmt(val) : "—";
+        if (c.key === "name") return `<td><span class="swatch" style="background:${swatch}"></span>${text}</td>`;
+        if (c.key === "note") return `<td class="note-cell" title="${text}">${text}</td>`;
+        return `<td class="num">${text}</td>`;
+      }).join("") +
+      "</tr>";
+  }).join("");
+}
+
+document.querySelector("#leaderTable thead tr").addEventListener("click", e => {
+  const th = e.target.closest("th[data-key]");
+  if (!th) return;
+  const key = th.dataset.key;
+  if (key === sortKey) {
+    sortAsc = !sortAsc;
+  } else {
+    sortKey = key;
+    const col = COLS.find(c => c.key === key);
+    // default direction: lower-is-better cols sort asc, others desc
+    sortAsc = col.lower === true;
+  }
+  renderTable();
+});
+
+renderTable();
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+function barDatasets(values, alpha) {
+  return D.labels.map((label, i) => ({
+    label,
+    data: [values[i]],
+    backgroundColor: D.colors[i] + (alpha || "cc"),
+    borderColor:     D.colors[i],
+    borderWidth: 1.5,
+    borderRadius: 5,
+  }));
+}
+
+function lineDatasets() {
+  return D.labels.map((label, i) => ({
+    label,
+    data: D.rpa_by_snr[i],
+    borderColor: D.colors[i],
+    backgroundColor: D.colors[i] + "30",
+    borderWidth: 2.5,
+    pointRadius: 5,
+    tension: 0.3,
+    fill: false,
+  }));
+}
+
+function gerLineDatasets() {
+  return D.labels.map((label, i) => ({
+    label,
+    data: D.ger_by_snr[i],
+    borderColor: D.colors[i],
+    backgroundColor: D.colors[i] + "30",
+    borderWidth: 2.5,
+    pointRadius: 5,
+    tension: 0.3,
+    fill: false,
+  }));
+}
+
+const pctOptions = (suffix, legendPos) => ({
+  responsive: true,
+  plugins: {
+    legend: { position: legendPos || "top", labels: { boxWidth: 14, font: { size: 11 } } },
+    tooltip: { callbacks: { label: ctx => ` ${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}${suffix}` } },
+  },
+  scales: {
+    y: { ticks: { callback: v => v + suffix }, beginAtZero: false },
+    x: { grid: { display: false } },
+  },
+});
+
+// ── summary bar charts ────────────────────────────────────────────────────────
+
+new Chart(document.getElementById("rpaCleanchart"), {
+  type: "bar",
+  data: { labels: ["RPA Clean"], datasets: barDatasets(D.rpa_clean) },
+  options: pctOptions("%"),
+});
+
+new Chart(document.getElementById("rpaMacrochart"), {
+  type: "bar",
+  data: { labels: ["RPA Macro Avg"], datasets: barDatasets(D.rpa_macro) },
+  options: pctOptions("%"),
+});
+
+new Chart(document.getElementById("gerCleanchart"), {
+  type: "bar",
+  data: { labels: ["GER Clean"], datasets: barDatasets(D.ger_clean) },
+  options: pctOptions("%"),
+});
+
+new Chart(document.getElementById("gerMacrochart"), {
+  type: "bar",
+  data: { labels: ["GER Macro Avg"], datasets: barDatasets(D.ger_macro) },
+  options: pctOptions("%"),
+});
+
+// ── per-SNR line charts ───────────────────────────────────────────────────────
+
+new Chart(document.getElementById("rpaSnrchart"), {
+  type: "line",
+  data: { labels: D.snr_labels, datasets: lineDatasets() },
+  options: {
+    ...pctOptions("%", "top"),
+    scales: {
+      y: { min: 0, max: 100, ticks: { callback: v => v + "%" } },
+      x: { grid: { color: "#eee" } },
+    },
+  },
+});
+
+new Chart(document.getElementById("gerSnrchart"), {
+  type: "line",
+  data: { labels: D.snr_labels, datasets: gerLineDatasets() },
+  options: {
+    ...pctOptions("%", "top"),
+    scales: {
+      y: { min: 0, ticks: { callback: v => v + "%" } },
+      x: { grid: { color: "#eee" } },
+    },
+  },
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+name: "Dabin Seomun"
+note: "Noise augmentation using a normal distribution for SNR sampling (mean=10, std=5) & Ran 100 epochs"

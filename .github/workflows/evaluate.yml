@@ -1,0 +1,374 @@
+name: Evaluate Submission
+
+on:
+  pull_request:
+    paths:
+      - "submissions/**"
+  push:
+    branches:
+      - main
+    paths:
+      - "submissions/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to commit leaderboard update on merge
+  pull-requests: write   # needed to post PR comments
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 1: run on every PR that touches submissions/
+  # ──────────────────────────────────────────────────────────────────────────
+  evaluate-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # needed to compare against base branch
+
+      # ── Submission hygiene check ────────────────────────────────────────────
+      # Runs before installing deps so bad PRs fail fast and cheaply.
+      - name: Validate submission contents
+        run: |
+          failed=false
+
+          # Reject any changes outside submissions/.
+          echo "=== All changed files in this PR ==="
+          git diff --name-only origin/${{ github.base_ref }}...HEAD
+          echo "=== End of changed files ==="
+
+          outside=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep -v '^submissions/' || true)
+          if [ -n "$outside" ]; then
+            echo "::error::PRs may only add files inside submissions/. The following files are not allowed:"
+            echo "$outside" | while read f; do echo "  $f"; done
+            exit 1
+          fi
+
+          # Find every submissions/* directory touched in this PR.
+          changed_dirs=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep '^submissions/' \
+            | awk -F/ '{print $1"/"$2}' \
+            | sort -u)
+
+          for sub_dir in $changed_dirs; do
+            [ -z "$sub_dir" ] && continue
+            slug=$(basename "$sub_dir")
+            [ "$slug" = "example" ] && continue
+
+            echo "Checking $sub_dir..."
+
+            # 1. Required files must exist.
+            if [ ! -f "$sub_dir/submission.yaml" ]; then
+              echo "::error::$sub_dir is missing submission.yaml"
+              failed=true
+            fi
+
+            # 2. Exactly one .pth file allowed (the best checkpoint only).
+            pth_count=$(find "$sub_dir" -name "*.pth" | wc -l | tr -d ' ')
+            if [ "$pth_count" -eq 0 ]; then
+              echo "::error::$sub_dir has no .pth checkpoint file."
+              failed=true
+            elif [ "$pth_count" -gt 1 ]; then
+              echo "::error::$sub_dir has $pth_count .pth files — submit only your best checkpoint (one file)."
+              find "$sub_dir" -name "*.pth" | while read f; do echo "  $f"; done
+              failed=true
+            fi
+
+            # 3. No data files (.npz, .wav, .mp3, .pt, .bin, .h5, .npy, .csv).
+            data_files=$(find "$sub_dir" -type f \
+              \( -name "*.npz" -o -name "*.wav" -o -name "*.mp3" \
+                 -o -name "*.pt"  -o -name "*.bin" -o -name "*.h5" \
+                 -o -name "*.npy" -o -name "*.csv" \))
+            if [ -n "$data_files" ]; then
+              echo "::error::$sub_dir contains data files that should not be committed:"
+              echo "$data_files" | while read f; do echo "  $f"; done
+              failed=true
+            fi
+
+            # 4. No TensorBoard / experiment directories.
+            for banned in runs logs tb events checkpoints; do
+              if [ -d "$sub_dir/$banned" ]; then
+                echo "::error::$sub_dir/$banned/ should not be committed — submit only weights.pth and submission.yaml."
+                failed=true
+              fi
+            done
+
+            # 5. Individual file size cap (20 MB).
+            while IFS= read -r -d '' f; do
+              size_mb=$(du -m "$f" | cut -f1)
+              if [ "$size_mb" -gt 20 ]; then
+                echo "::error::$f is ${size_mb}MB — individual files must be under 20 MB."
+                failed=true
+              fi
+            done < <(find "$sub_dir" -type f -print0)
+
+            # 6. Total submission directory size cap (25 MB).
+            total_mb=$(du -sm "$sub_dir" | cut -f1)
+            if [ "$total_mb" -gt 25 ]; then
+              echo "::error::$sub_dir is ${total_mb}MB total — submission must be under 25 MB. Only weights.pth and submission.yaml should be included."
+              failed=true
+            fi
+          done
+
+          if [ "$failed" = "true" ]; then
+            echo ""
+            echo "Fix the issues above and push again. See CONTRIBUTING.md for what to include."
+            exit 1
+          fi
+          echo "All submission checks passed."
+
+      # ── Python + deps ──────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy huggingface_hub
+
+      # ── Data ───────────────────────────────────────────────────────────────
+      - name: Download test set
+        # Only download test.npz — clean.npz and noise.npz are training-only.
+        run: |
+          mkdir -p data
+          python - <<'EOF'
+          from huggingface_hub import hf_hub_download
+          hf_hub_download(
+              repo_id="smulelabs/NanoPitch-PreExtract",
+              repo_type="dataset",
+              filename="test.npz",
+              local_dir="data",
+          )
+          EOF
+
+      - name: Override with hidden test set (if configured)
+        # Set the repository secret HIDDEN_TEST_NPZ_URL to a direct download URL.
+        # The file will replace data/test.npz before evaluation runs.
+        env:
+          HIDDEN_TEST_NPZ_URL: ${{ secrets.HIDDEN_TEST_NPZ_URL }}
+        run: |
+          if [ -n "$HIDDEN_TEST_NPZ_URL" ]; then
+            echo "Downloading hidden test set..."
+            curl -fsSL "$HIDDEN_TEST_NPZ_URL" -o data/test.npz
+            echo "Hidden test.npz in place."
+          else
+            echo "No hidden test set configured, using public test.npz."
+          fi
+
+      # ── Find changed submission ─────────────────────────────────────────────
+      - name: Detect changed submission directory
+        id: detect
+        run: |
+          # List all submission directories touched in this PR.
+          changed=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+            | grep '^submissions/' \
+            | awk -F/ '{print $1"/"$2}' \
+            | sort -u)
+
+          echo "Changed submission dirs:"
+          echo "$changed"
+
+          count=$(echo "$changed" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "No submission directories changed — skipping evaluation."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::warning::Multiple submission directories changed in one PR. Evaluating all of them."
+          fi
+
+          echo "dirs=$changed" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      # ── Evaluate each changed submission ───────────────────────────────────
+      - name: Run evaluation
+        if: steps.detect.outputs.skip != 'true'
+        id: evaluate
+        run: |
+          mkdir -p results
+
+          summary=""
+          all_passed=true
+
+          while IFS= read -r sub_dir; do
+            [ -z "$sub_dir" ] && continue
+            slug=$(basename "$sub_dir")
+            out="results/${slug}.json"
+
+            echo "::group::Evaluating $sub_dir"
+            if python scripts/evaluate_submission.py \
+                  --submission "$sub_dir" \
+                  --data-dir data \
+                  --output-json "$out"; then
+              echo "::endgroup::"
+              # Extract key metrics for the PR comment.
+              # evaluate.py writes nested JSON: {"clean": {"realtime_rpa": 0.83, ...}, ...}
+              rpa=$(python -c "import json; d=json.load(open('$out')); v=d.get('clean',{}).get('realtime_rpa'); print(f'{v*100:.1f}%' if v is not None else 'n/a')" 2>/dev/null || echo "n/a")
+              vad=$(python -c "import json; d=json.load(open('$out')); v=d.get('clean',{}).get('vad_acc'); print(f'{v*100:.1f}%' if v is not None else 'n/a')" 2>/dev/null || echo "n/a")
+              med=$(python -c "import json; d=json.load(open('$out')); v=d.get('clean',{}).get('realtime_median_cents'); print(f'{v:.1f}¢' if v is not None else 'n/a')" 2>/dev/null || echo "n/a")
+              name=$(python -c "import json; d=json.load(open('$out')); print(d.get('student_name', '$slug'))" 2>/dev/null || echo "$slug")
+              note=$(python -c "import json; d=json.load(open('$out')); print(d.get('note', ''))" 2>/dev/null || echo "")
+              summary="${summary}
+          ### ${name}
+          | Metric | Value |
+          |--------|-------|
+          | RPA (realtime, clean) | ${rpa} |
+          | VAD Accuracy | ${vad} |
+          | Median Cent Error | ${med} |
+
+          **Note:** ${note}
+          "
+            else
+              echo "::endgroup::"
+              all_passed=false
+              summary="${summary}
+          ### ❌ ${slug} — Evaluation failed
+          Check the workflow logs for details.
+          "
+            fi
+          done <<< "${{ steps.detect.outputs.dirs }}"
+
+          # Write summary to a file so the comment step can read it safely.
+          printf '%s' "$summary" > /tmp/eval_summary.txt
+          echo "all_passed=$all_passed" >> "$GITHUB_OUTPUT"
+
+      # ── Post PR comment ─────────────────────────────────────────────────────
+      - name: Post results as PR comment
+        if: steps.detect.outputs.skip != 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.LEADERBOARD_PAT || secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('/tmp/eval_summary.txt', 'utf8').trim();
+            const passed = '${{ steps.evaluate.outputs.all_passed }}' === 'true';
+
+            const icon = passed ? '✅' : '❌';
+            const body = `## ${icon} NanoPitch Evaluation Results
+
+            ${summary}
+
+            > Scores shown are for the **realtime Viterbi decoder** (matches browser deployment).
+            > The leaderboard will be updated automatically when this PR is merged.
+            `;
+
+            // Find and update any existing bot comment, or post a new one.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('NanoPitch Evaluation Results')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # JOB 2: update the leaderboard after a merge to main
+  # ──────────────────────────────────────────────────────────────────────────
+  update-leaderboard:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.LEADERBOARD_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy huggingface_hub
+
+      - name: Download test set
+        run: |
+          mkdir -p data
+          python - <<'EOF'
+          from huggingface_hub import hf_hub_download
+          hf_hub_download(
+              repo_id="smulelabs/NanoPitch-PreExtract",
+              repo_type="dataset",
+              filename="test.npz",
+              local_dir="data",
+          )
+          EOF
+
+      - name: Override with hidden test set (if configured)
+        env:
+          HIDDEN_TEST_NPZ_URL: ${{ secrets.HIDDEN_TEST_NPZ_URL }}
+        run: |
+          if [ -n "$HIDDEN_TEST_NPZ_URL" ]; then
+            echo "Downloading hidden test set..."
+            curl -fsSL "$HIDDEN_TEST_NPZ_URL" -o data/test.npz
+            echo "Hidden test.npz in place."
+          else
+            echo "No hidden test set configured, using public test.npz."
+          fi
+
+      # Only evaluate submissions that don't have a result JSON yet.
+      # To re-evaluate everything (e.g. after switching to hidden test set),
+      # manually delete results/*.json and re-run via workflow_dispatch.
+      - name: Evaluate new submissions
+        run: |
+          mkdir -p results
+          for sub_dir in submissions/*/; do
+            slug=$(basename "$sub_dir")
+            [ "$slug" = "example" ] && continue
+            out="results/${slug}.json"
+            if [ -f "$out" ]; then
+              echo "=== Skipping $slug (result already exists) ==="
+              continue
+            fi
+            echo "=== Evaluating $slug ==="
+            python scripts/evaluate_submission.py \
+              --submission "$sub_dir" \
+              --data-dir data \
+              --output-json "$out" || \
+              echo "WARNING: evaluation failed for $slug — skipping."
+          done
+
+      - name: Rebuild leaderboard
+        run: python scripts/update_leaderboard.py --results-dir results --output LEADERBOARD.md
+
+      - name: Generate chart visualizations
+        run: python scripts/generate_charts.py --results-dir results --output leaderboard_charts.html
+
+      - name: Commit updated leaderboard and results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add LEADERBOARD.md leaderboard_charts.html results/
+          git diff --cached --quiet && echo "Nothing to commit." || \
+            git commit -m "chore: update leaderboard [skip ci]"
+          git push

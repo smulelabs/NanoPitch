@@ -1,0 +1,2 @@
+name: "Elliot Lee – Augment Mel + Wide SNR"
+description: "NanoPitch model with augment_mel_batch and SNR range [-10, 30]"

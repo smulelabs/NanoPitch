@@ -1,0 +1,2 @@
+name: "Rajat Sharma"
+note: "Baseline run with default hyperparameters and default augmentation (gru_size=96, cond_size=64, lr=1e-3)."

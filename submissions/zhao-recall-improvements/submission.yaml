@@ -1,0 +1,2 @@
+name: "Chris Rui Zhao"
+note: "Added augmentations, specaugment, cosine annealing, and BCEWithLogitsLoss with Claude Opus 4.7's suggestions."

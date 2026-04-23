@@ -1,0 +1,2 @@
+name: "Xin Zheng"
+note: "Implemented augment_mel_batch with torch.logaddexp for numerically stable log-mel noise mixing. Applied random SNR augmentation (-10 to +30 dB) and weighted pitch loss (w-pitch=2.0) to improve robustness. Achieved 95.98% offline RPA (clean) and 91.08% RPA (-5dB SNR), with realtime browser performance at 94.35% RPA (clean) and 89.63% RPA (-5dB)."

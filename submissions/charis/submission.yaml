@@ -1,0 +1,2 @@
+name: "Charis Test"
+note: "Baseline run with default hyperparameters (gru_size=96, cond_size=64, lr=1e-3)."

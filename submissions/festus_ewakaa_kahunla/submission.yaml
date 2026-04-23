@@ -1,0 +1,2 @@
+name: "Festus Ewakaa Kahunla"
+note: "Fixed train/eval label mismatch: VAD target now derived from f0>0 (RMVPE) instead of the RMS-energy vad label, which disagrees with RMVPE on 12.1% of frames. Added cosine annealing LR (CosineAnnealingWarmRestarts, T_0=10, T_mult=2, eta_min=1e-5). Reduced Viterbi onset penalty from 2.0 to 1.0. Trained 100 epochs from scratch (50 + 50 resume)."

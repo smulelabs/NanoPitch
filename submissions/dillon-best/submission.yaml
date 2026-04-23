@@ -1,0 +1,2 @@
+name: "Dillon Best"
+note: "150 epoch, 112 GRU, tweaked VAD RPA loss weights, started with 5 + 20 individual feature training epochs, cosine annealing, 0.6 voiced/unvoiced weighting, augmentation + clean probability"
