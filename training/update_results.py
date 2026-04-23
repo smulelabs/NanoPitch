@@ -31,28 +31,48 @@ import torch
 TRAIN_DEFAULTS = {
     "cond_size": 64, "gru_size": 96,
     "epochs": 50, "batch_size": 32, "lr": 1e-3, "seq_len": 200,
-    "num_workers": 0, "amp": False,
+    "num_workers": 0,
     "snr_range": [-5.0, 20.0], "p_clean": 0.0, "snr_bias": 1.0,
     "w_vad": 0.1, "w_pitch": 1.0,
+    "vad_loss": "bce", "vad_pos_weight": 2.3, "vad_focal_gamma": 2.0,
+    "balanced_sampling": False,
     "pitch_sigma": 1.2, "pitch_mask": "vad",
     "scheduler": "constant", "vad_target": "f0", "eval_vdr": "pitch",
     "augment": "none",
+    "freq_mask_param": 4, "n_freq_masks": 2,
+    "time_mask_param": 10, "n_time_masks": 2,
     "lr_t0": 10, "patience": 0,
     "curriculum": False,
     "curriculum_vad_epochs": 10, "curriculum_pitch_epochs": 20,
+    "resume": None,
 }
 
 # Which args are interesting to show in the "Key args" column. Paths/device
 # are excluded — they don't affect what the model learned.
 INTERESTING_ARGS = [
     "cond_size", "gru_size", "seq_len", "epochs", "batch_size", "lr",
-    "w_vad", "w_pitch", "amp",
+    "w_vad", "w_pitch",
+    "vad_loss", "vad_pos_weight", "vad_focal_gamma",
+    "balanced_sampling",
     "scheduler", "lr_t0",
     "vad_target", "augment", "p_clean", "snr_bias", "snr_range",
+    "freq_mask_param", "n_freq_masks", "time_mask_param", "n_time_masks",
     "pitch_sigma", "pitch_mask",
     "curriculum", "curriculum_vad_epochs", "curriculum_pitch_epochs",
-    "eval_vdr",
+    "eval_vdr", "resume",
 ]
+
+
+def _resume_base_run(resume_path):
+    """Given a --resume path like './runs/foo/checkpoints/best.pth', return
+    the base run name ('foo'). Fall back to the file basename."""
+    p = os.path.normpath(resume_path)
+    parts = p.split(os.sep)
+    if "checkpoints" in parts:
+        i = parts.index("checkpoints")
+        if i > 0:
+            return parts[i - 1]
+    return os.path.basename(p)
 
 
 def fmt_val(v):
@@ -65,6 +85,43 @@ def fmt_val(v):
     return str(v)
 
 
+def _parse_metric_val(cell_str):
+    """Extract the numeric value from a cell like '95.0 (+3.9)' or '95.0'."""
+    m = re.match(r"\s*([\d.]+)", cell_str.strip())
+    return float(m.group(1)) if m else None
+
+
+def _fmt_with_delta(val, base_val):
+    """Format a metric value with its signed delta from baseline."""
+    if base_val is None or val is None:
+        return f"{val:.1f}" if val is not None else "—"
+    d = val - base_val
+    sign = "+" if d >= 0 else ""
+    return f"{val:.1f} ({sign}{d:.1f})"
+
+
+def _extract_baseline_from_runs(results_md_path):
+    """Return {vad, rt_rpa, rt_vdr, rt_med} from the 'baseline' Runs row, or None."""
+    with open(results_md_path, "r") as f:
+        lines = f.readlines()
+    sl = _section_slice(lines, "Runs")
+    if sl is None:
+        return None
+    _, _, rows = sl
+    for row in rows:
+        m = DATA_ROW_RE.match(row)
+        if m and m.group(1) == "baseline":
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            if len(cells) >= 8:
+                return {
+                    "vad":    _parse_metric_val(cells[4]),
+                    "rt_rpa": _parse_metric_val(cells[5]),
+                    "rt_vdr": _parse_metric_val(cells[6]),
+                    "rt_med": _parse_metric_val(cells[7]),
+                }
+    return None
+
+
 def diff_args(args):
     """Return list of 'flag=value' strings for non-default interesting args."""
     out = []
@@ -75,7 +132,10 @@ def diff_args(args):
         dv = TRAIN_DEFAULTS.get(k)
         if v == dv:
             continue
-        out.append(f"`--{k.replace('_', '-')}`={fmt_val(v)}")
+        if k == "resume" and v:
+            out.append(f"`--resume`={_resume_base_run(v)}")
+        else:
+            out.append(f"`--{k.replace('_', '-')}`={fmt_val(v)}")
     return out
 
 
@@ -147,12 +207,10 @@ def parse_eval(stdout):
 
 
 def summary_metrics(parsed):
-    """Collapse parsed per-condition data into the summary-row scalars."""
-    off = parsed["offline"]["overall"]
+    """Collapse parsed per-condition data into the summary-row scalars.
+    Tracked metrics are realtime-only; VAD Acc is decoder-independent."""
     rt = parsed["realtime"]["overall"]
-    # VAD Acc is decoder-independent → same value in both tables.
-    return {"vad": off[0],
-            "off_rpa": off[2], "off_vdr": off[1], "off_med": off[5],
+    return {"vad": rt[0],
             "rt_rpa": rt[2], "rt_vdr": rt[1], "rt_med": rt[5]}
 
 
@@ -167,13 +225,21 @@ def per_condition_rpa(parsed):
     return out
 
 
-def make_summary_row(number, name, args_diff, note, metrics):
+def make_summary_row(number, name, args_diff, note, metrics, baseline_metrics=None):
     ka = ", ".join(args_diff) if args_diff else "defaults"
     note_cell = note or "_tbd_"
+    if baseline_metrics and name != "baseline":
+        vad_s = _fmt_with_delta(metrics["vad"],    baseline_metrics["vad"])
+        rpa_s = _fmt_with_delta(metrics["rt_rpa"], baseline_metrics["rt_rpa"])
+        vdr_s = _fmt_with_delta(metrics["rt_vdr"], baseline_metrics["rt_vdr"])
+        med_s = _fmt_with_delta(metrics["rt_med"], baseline_metrics["rt_med"])
+    else:
+        vad_s = f"{metrics['vad']:.1f}"
+        rpa_s = f"{metrics['rt_rpa']:.1f}"
+        vdr_s = f"{metrics['rt_vdr']:.1f}"
+        med_s = f"{metrics['rt_med']:.1f}"
     return (f"| {number} | `{name}` | {ka} | {note_cell} | "
-            f"{metrics['vad']:.1f} | {metrics['off_rpa']:.1f} | "
-            f"{metrics['off_med']:.1f} | {metrics['rt_rpa']:.1f} | "
-            f"{metrics['rt_vdr']:.1f} | {metrics['rt_med']:.1f} |")
+            f"{vad_s} | {rpa_s} | {vdr_s} | {med_s} |")
 
 
 def make_per_cond_row(number, name, per_cond):
@@ -215,31 +281,123 @@ def _renumber(data_rows):
     return out
 
 
-def upsert_row(results_md_path, section_title, run_name, new_row,
-               sort_by_last_col_desc=False):
-    """Replace any existing row matching `run_name` inside
-    `## <section_title>`, else append. Always renumbers rows 1..N. If
-    `sort_by_last_col_desc` is true, sort data rows by the last numeric
-    column (descending) before renumbering."""
-    with open(results_md_path, "r") as f:
-        lines = f.readlines()
-
+def _section_slice(lines, section_title):
+    """Return (header_end, data_end, data_rows_list) for the given section,
+    or None if the section doesn't exist."""
     bounds = _section_bounds(lines, section_title)
     if bounds is None:
-        sys.exit(f"Section '## {section_title}' not found in {results_md_path}")
+        return None
     start, end = bounds
-
-    # Split the section into: header/separator, data rows, trailing blanks.
     header_end = start
     while header_end < end and not DATA_ROW_RE.match(lines[header_end]):
         header_end += 1
     data_end = header_end
     while data_end < end and DATA_ROW_RE.match(lines[data_end]):
         data_end += 1
-
     data_rows = [l.rstrip("\n") for l in lines[header_end:data_end]]
+    return header_end, data_end, data_rows
 
-    # Replace or append.
+
+def _write_section(results_md_path, section_title, new_data_rows):
+    with open(results_md_path, "r") as f:
+        lines = f.readlines()
+    sl = _section_slice(lines, section_title)
+    if sl is None:
+        sys.exit(f"Section '## {section_title}' not found in {results_md_path}")
+    header_end, data_end, _ = sl
+    new_lines = (lines[:header_end]
+                 + [r + "\n" for r in new_data_rows]
+                 + lines[data_end:])
+    with open(results_md_path, "w") as f:
+        f.writelines(new_lines)
+
+
+def _runs_name_to_number(results_md_path):
+    """Map run-name → integer row # from the Runs section (post-renumber)."""
+    with open(results_md_path, "r") as f:
+        lines = f.readlines()
+    sl = _section_slice(lines, "Runs")
+    if sl is None:
+        return {}
+    _, _, rows = sl
+    out = {}
+    num_re = re.compile(r"^\|\s*(\d+)\s*\|")
+    for row in rows:
+        name_m = DATA_ROW_RE.match(row)
+        num_m = num_re.match(row)
+        if name_m and num_m:
+            out[name_m.group(1)] = int(num_m.group(1))
+    return out
+
+
+def _renumber_from_map(data_rows, name_to_num):
+    """Rewrite the leading '| N |' of each row using name_to_num. Unknown
+    names fall back to '—'."""
+    out = []
+    for row in data_rows:
+        m = DATA_ROW_RE.match(row)
+        name = m.group(1) if m else None
+        num = name_to_num.get(name)
+        label = str(num) if num is not None else "—"
+        out.append(re.sub(r"^\|\s*[^|]*\|", f"| {label} |", row, count=1))
+    return out
+
+
+def reformat_deltas(results_md_path):
+    """Rewrite every Runs row to include (±delta) annotations from baseline.
+    Baseline row itself shows plain numbers. Idempotent — safe to re-run."""
+    baseline = _extract_baseline_from_runs(results_md_path)
+    if baseline is None:
+        sys.exit("No 'baseline' row found in Runs table — cannot compute deltas.")
+    with open(results_md_path, "r") as f:
+        lines = f.readlines()
+    sl = _section_slice(lines, "Runs")
+    if sl is None:
+        sys.exit("'## Runs' section not found.")
+    _, _, rows = sl
+    new_rows = []
+    for row in rows:
+        m = DATA_ROW_RE.match(row)
+        if not m:
+            new_rows.append(row)
+            continue
+        name = m.group(1)
+        cells = [c.strip() for c in row.strip().strip("|").split("|")]
+        if len(cells) < 8:
+            new_rows.append(row)
+            continue
+        vad_v = _parse_metric_val(cells[4])
+        rpa_v = _parse_metric_val(cells[5])
+        vdr_v = _parse_metric_val(cells[6])
+        med_v = _parse_metric_val(cells[7])
+        if name == "baseline":
+            vad_s, rpa_s, vdr_s, med_s = (f"{vad_v:.1f}", f"{rpa_v:.1f}",
+                                           f"{vdr_v:.1f}", f"{med_v:.1f}")
+        else:
+            vad_s = _fmt_with_delta(vad_v, baseline["vad"])
+            rpa_s = _fmt_with_delta(rpa_v, baseline["rt_rpa"])
+            vdr_s = _fmt_with_delta(vdr_v, baseline["rt_vdr"])
+            med_s = _fmt_with_delta(med_v, baseline["rt_med"])
+        new_rows.append(f"| {cells[0]} | {cells[1]} | {cells[2]} | {cells[3]} | "
+                        f"{vad_s} | {rpa_s} | {vdr_s} | {med_s} |")
+    _write_section(results_md_path, "Runs", new_rows)
+    print(f"Reformatted {len(new_rows)} rows with delta annotations.")
+
+
+def upsert_row(results_md_path, section_title, run_name, new_row,
+               sort_by_last_col_desc=False, renumber_from=None):
+    """Replace any existing row matching `run_name` inside
+    `## <section_title>`, else append. If `sort_by_last_col_desc` is true,
+    sort data rows by the last numeric column (descending) before renumbering.
+    If `renumber_from` is a dict(name→int), use it to renumber; otherwise
+    renumber sequentially 1..N."""
+    with open(results_md_path, "r") as f:
+        lines = f.readlines()
+    sl = _section_slice(lines, section_title)
+    if sl is None:
+        sys.exit(f"Section '## {section_title}' not found in {results_md_path}")
+    _, _, data_rows = sl
+
     replaced = False
     for i, row in enumerate(data_rows):
         m = DATA_ROW_RE.match(row)
@@ -254,27 +412,75 @@ def upsert_row(results_md_path, section_title, run_name, new_row,
         def last_val(row):
             cells = [c.strip() for c in row.strip().strip("|").split("|")]
             try:
-                return float(cells[-1])
-            except ValueError:
+                return _parse_metric_val(cells[-1]) or float("-inf")
+            except (ValueError, IndexError):
                 return float("-inf")
         data_rows.sort(key=last_val, reverse=True)
 
-    data_rows = _renumber(data_rows)
+    # Pin baseline to the top of the Runs section (not per-condition).
+    if section_title == "Runs":
+        base = [r for r in data_rows
+                if DATA_ROW_RE.match(r) and DATA_ROW_RE.match(r).group(1) == "baseline"]
+        rest = [r for r in data_rows
+                if not (DATA_ROW_RE.match(r) and DATA_ROW_RE.match(r).group(1) == "baseline")]
+        data_rows = base + rest
 
-    new_lines = (lines[:header_end]
-                 + [r + "\n" for r in data_rows]
-                 + lines[data_end:])
-    with open(results_md_path, "w") as f:
-        f.writelines(new_lines)
+    if renumber_from is not None:
+        data_rows = _renumber_from_map(data_rows, renumber_from)
+    else:
+        data_rows = _renumber(data_rows)
+
+    _write_section(results_md_path, section_title, data_rows)
     action = "Updated" if replaced else "Appended"
     print(f"{action} '{run_name}' in section '{section_title}'")
 
 
+def delete_row(results_md_path, run_name):
+    """Remove `run_name` from Runs + Per-condition rtRPA, then renumber:
+    Runs sequentially 1..N, per-condition rows using the new Runs map."""
+    removed_any = False
+    for section in ("Runs", "Per-condition rtRPA"):
+        with open(results_md_path, "r") as f:
+            lines = f.readlines()
+        sl = _section_slice(lines, section)
+        if sl is None:
+            continue
+        _, _, data_rows = sl
+        new_rows = []
+        removed_here = False
+        for row in data_rows:
+            m = DATA_ROW_RE.match(row)
+            if m and m.group(1) == run_name:
+                removed_here = True
+                continue
+            new_rows.append(row)
+        if not removed_here:
+            continue
+        removed_any = True
+        if section == "Runs":
+            new_rows = _renumber(new_rows)
+        _write_section(results_md_path, section, new_rows)
+        print(f"Removed '{run_name}' from section '{section}'")
+
+    # Re-sync per-condition numbering against the updated Runs table.
+    name_to_num = _runs_name_to_number(results_md_path)
+    with open(results_md_path, "r") as f:
+        lines = f.readlines()
+    sl = _section_slice(lines, "Per-condition rtRPA")
+    if sl is not None:
+        _, _, data_rows = sl
+        _write_section(results_md_path, "Per-condition rtRPA",
+                       _renumber_from_map(data_rows, name_to_num))
+
+    if not removed_any:
+        print(f"No row matching '{run_name}' found.")
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--run-dir", required=True,
+    p.add_argument("--run-dir", default=None,
                    help="path to run directory containing checkpoints/")
-    p.add_argument("--data-dir", required=True,
+    p.add_argument("--data-dir", default=None,
                    help="folder containing clean.npz, noise.npz, test.npz")
     p.add_argument("--checkpoint", default="best.pth",
                    help="checkpoint filename inside <run-dir>/checkpoints/")
@@ -286,7 +492,27 @@ def main():
                    help="path to RESULTS.MD (default: ../RESULTS.MD)")
     p.add_argument("--print-only", action="store_true",
                    help="print the markdown row to stdout, don't touch the file")
+    p.add_argument("--delete", default=None, metavar="NAME",
+                   help="remove the named run from both tables and exit")
+    p.add_argument("--reformat-deltas", action="store_true",
+                   help="rewrite the Runs table so every row shows (±delta) from "
+                        "the 'baseline' row; then exit")
     cli = p.parse_args()
+
+    results_md = cli.results_md or os.path.join(
+        os.path.dirname(__file__), "..", "RESULTS.MD")
+    results_md = os.path.abspath(results_md)
+
+    if cli.delete:
+        delete_row(results_md, cli.delete)
+        return
+
+    if cli.reformat_deltas:
+        reformat_deltas(results_md)
+        return
+
+    if not cli.run_dir or not cli.data_dir:
+        sys.exit("--run-dir and --data-dir are required (unless using --delete).")
 
     ckpt_path = os.path.join(cli.run_dir, "checkpoints", cli.checkpoint)
     if not os.path.isfile(ckpt_path):
@@ -303,7 +529,9 @@ def main():
     per_cond = per_condition_rpa(parsed)
 
     name = cli.name or os.path.basename(os.path.normpath(cli.run_dir))
-    summary_row = make_summary_row("_", name, diff_args(args), cli.note, metrics)
+    baseline_metrics = _extract_baseline_from_runs(results_md)
+    summary_row = make_summary_row("_", name, diff_args(args), cli.note, metrics,
+                                   baseline_metrics)
     per_cond_row = make_per_cond_row("_", name, per_cond)
     print(summary_row)
     print(per_cond_row)
@@ -311,12 +539,12 @@ def main():
     if cli.print_only:
         return
 
-    results_md = cli.results_md or os.path.join(
-        os.path.dirname(__file__), "..", "RESULTS.MD")
-    results_md = os.path.abspath(results_md)
+    # Runs section: sequential renumber. Then reload to get the authoritative
+    # name→number map and use it to number the per-condition row.
     upsert_row(results_md, "Runs", name, summary_row)
+    name_to_num = _runs_name_to_number(results_md)
     upsert_row(results_md, "Per-condition rtRPA", name, per_cond_row,
-               sort_by_last_col_desc=True)
+               sort_by_last_col_desc=True, renumber_from=name_to_num)
 
 
 if __name__ == "__main__":
