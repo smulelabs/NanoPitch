@@ -2,6 +2,8 @@
 
 Train a neural network that tracks pitch and detects singing in real-time on your laptop, then deploy it to run live in a web browser.
 
+This repository have been used in a classroom education setting. For our findings on its effectiveness in teaching deep learning, please refer to nanopitch.pdf.
+
 ## What You'll Learn
 
 - **How neural networks process audio** — converting sound to mel spectrograms, feeding them through recurrent layers (GRUs), and interpreting the output
